@@ -304,3 +304,80 @@
     (ok true)
   )
 )
+
+
+(define-read-only (get-tenant-payment-history (tenant principal))
+  (let (
+    (tenant-info (unwrap! (get-tenant-info tenant) ERR_NOT_REGISTERED))
+    (current-date (get-current-month-year))
+    (current-year (get year current-date))
+    (payments (list))
+  )
+    (ok (map get-payment-record 
+      (list tenant tenant tenant tenant tenant tenant)
+      (list u1 u2 u3 u4 u5 u6)
+      (list current-year current-year current-year current-year current-year current-year)
+    ))
+  )
+)
+
+
+
+(define-constant ERR_NO_MAINTENANCE_REQUEST (err u110))
+(define-constant ERR_REQUEST_ALREADY_EXISTS (err u111))
+
+(define-map maintenance-requests
+  { request-id: uint, property-id: uint }
+  {
+    tenant: principal,
+    description: (string-ascii 256),
+    status: (string-ascii 20),
+    timestamp: uint,
+    resolution-timestamp: (optional uint)
+  }
+)
+
+(define-data-var request-counter uint u0)
+
+(define-public (submit-maintenance-request (property-id uint) (description (string-ascii 256)))
+  (let (
+    (tenant tx-sender)
+    (tenant-info (unwrap! (get-tenant-info tenant) ERR_NOT_REGISTERED))
+    (request-id (+ (var-get request-counter) u1))
+  )
+    (asserts! (is-eq (get property-id tenant-info) property-id) ERR_UNAUTHORIZED)
+    
+    (map-set maintenance-requests
+      { request-id: request-id, property-id: property-id }
+      {
+        tenant: tenant,
+        description: description,
+        status: "pending",
+        timestamp: stacks-block-height,
+        resolution-timestamp: none
+      }
+    )
+    
+    (var-set request-counter request-id)
+    (ok request-id)
+  )
+)
+
+(define-public (resolve-maintenance-request (request-id uint) (property-id uint))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (request (unwrap! (map-get? maintenance-requests { request-id: request-id, property-id: property-id }) ERR_NO_MAINTENANCE_REQUEST))
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    
+    (map-set maintenance-requests
+      { request-id: request-id, property-id: property-id }
+      (merge request {
+        status: "resolved",
+        resolution-timestamp: (some stacks-block-height)
+      })
+    )
+    (ok true)
+  )
+)
