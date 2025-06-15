@@ -20,6 +20,32 @@
 
 (define-data-var contract-owner principal tx-sender)
 
+(define-constant ERR_INVALID_ESCALATION (err u112))
+(define-constant ERR_ESCALATION_EXISTS (err u113))
+(define-constant ERR_NO_ESCALATION (err u114))
+
+(define-map rent-escalations
+  { property-id: uint }
+  {
+    escalation-type: (string-ascii 10),
+    escalation-value: uint,
+    effective-date: uint,
+    frequency-months: uint,
+    last-applied: uint,
+    active: bool
+  }
+)
+
+(define-map rent-history
+  { property-id: uint, effective-date: uint }
+  {
+    old-rent: uint,
+    new-rent: uint,
+    escalation-applied: uint,
+    timestamp: uint
+  }
+)
+
 (define-map properties
   { property-id: uint }
   {
@@ -380,4 +406,144 @@
     )
     (ok true)
   )
+)
+
+
+
+
+(define-read-only (get-rent-escalation (property-id uint))
+  (map-get? rent-escalations { property-id: property-id })
+)
+
+(define-read-only (get-rent-history (property-id uint) (effective-date uint))
+  (map-get? rent-history { property-id: property-id, effective-date: effective-date })
+)
+
+(define-read-only (calculate-new-rent (property-id uint))
+  (let (
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (escalation (unwrap! (get-rent-escalation property-id) ERR_NO_ESCALATION))
+    (current-rent (get rent-amount property))
+    (escalation-type (get escalation-type escalation))
+    (escalation-value (get escalation-value escalation))
+  )
+    (ok (if (is-eq escalation-type "percentage")
+      (+ current-rent (/ (* current-rent escalation-value) u100))
+      (+ current-rent escalation-value)
+    ))
+  )
+)
+
+(define-read-only (is-escalation-due (property-id uint))
+  (let (
+    (escalation (unwrap! (get-rent-escalation property-id) false))
+    (effective-date (get effective-date escalation))
+    (frequency-months (get frequency-months escalation))
+    (last-applied (get last-applied escalation))
+    (next-due-date (+ last-applied (* frequency-months u30 SECONDS_IN_DAY)))
+  )
+    (and 
+      (get active escalation)
+      (>= stacks-block-height effective-date)
+      (>= stacks-block-height next-due-date)
+    )
+  )
+)
+
+(define-public (set-rent-escalation (property-id uint) (escalation-type (string-ascii 10)) (escalation-value uint) (effective-date uint) (frequency-months uint))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (or (is-eq escalation-type "percentage") (is-eq escalation-type "fixed")) ERR_INVALID_ESCALATION)
+    (asserts! (> escalation-value u0) ERR_INVALID_ESCALATION)
+    (asserts! (> frequency-months u0) ERR_INVALID_ESCALATION)
+    (asserts! (>= effective-date stacks-block-height) ERR_INVALID_ESCALATION)
+    
+    (map-set rent-escalations
+      { property-id: property-id }
+      {
+        escalation-type: escalation-type,
+        escalation-value: escalation-value,
+        effective-date: effective-date,
+        frequency-months: frequency-months,
+        last-applied: stacks-block-height,
+        active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (apply-rent-escalation (property-id uint))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (escalation (unwrap! (get-rent-escalation property-id) ERR_NO_ESCALATION))
+    (old-rent (get rent-amount property))
+    (new-rent (unwrap-panic (calculate-new-rent property-id)))
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (is-escalation-due property-id) ERR_INVALID_ESCALATION)
+    
+    (map-set properties
+      { property-id: property-id }
+      (merge property { rent-amount: new-rent })
+    )
+    
+    (map-set rent-escalations
+      { property-id: property-id }
+      (merge escalation { last-applied: stacks-block-height })
+    )
+    
+    (map-set rent-history
+      { property-id: property-id, effective-date: stacks-block-height }
+      {
+        old-rent: old-rent,
+        new-rent: new-rent,
+        escalation-applied: (get escalation-value escalation),
+        timestamp: stacks-block-height
+      }
+    )
+    
+    (ok new-rent)
+  )
+)
+
+(define-public (disable-rent-escalation (property-id uint))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (escalation (unwrap! (get-rent-escalation property-id) ERR_NO_ESCALATION))
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    
+    (map-set rent-escalations
+      { property-id: property-id }
+      (merge escalation { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (get-future-rent (property-id uint) (months-ahead uint))
+  (let (
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (escalation (unwrap! (get-rent-escalation property-id) ERR_NO_ESCALATION))
+    (current-rent (get rent-amount property))
+    (frequency (get frequency-months escalation))
+    (escalations-count (/ months-ahead frequency))
+    (escalation-value (get escalation-value escalation))
+    (escalation-type (get escalation-type escalation))
+  )
+    (if (is-eq escalation-type "percentage")
+      (ok (fold apply-percentage-increase (list escalations-count) current-rent))
+      (ok (+ current-rent (* escalations-count escalation-value)))
+    )
+  )
+)
+
+(define-private (apply-percentage-increase (count uint) (current-amount uint))
+  (+ current-amount (/ (* current-amount u5) u100))
 )
