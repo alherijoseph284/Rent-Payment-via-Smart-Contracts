@@ -547,3 +547,314 @@
 (define-private (apply-percentage-increase (count uint) (current-amount uint))
   (+ current-amount (/ (* current-amount u5) u100))
 )
+
+(define-constant ERR_LEASE_NOT_FOUND (err u115))
+(define-constant ERR_LEASE_EXPIRED (err u116))
+(define-constant ERR_LEASE_ALREADY_EXISTS (err u117))
+(define-constant ERR_INVALID_LEASE_TERM (err u118))
+(define-constant ERR_SCREENING_INCOMPLETE (err u119))
+(define-constant ERR_TENANT_REJECTED (err u120))
+(define-constant ERR_AUTO_RENEWAL_DISABLED (err u121))
+(define-constant ERR_EARLY_TERMINATION_NOT_ALLOWED (err u122))
+
+(define-map lease-agreements
+  { property-id: uint, lease-id: uint }
+  {
+    tenant: principal,
+    start-date: uint,
+    end-date: uint,
+    lease-term-months: uint,
+    security-deposit: uint,
+    monthly-rent: uint,
+    auto-renewal: bool,
+    renewal-notice-period: uint,
+    early-termination-allowed: bool,
+    early-termination-fee: uint,
+    lease-status: (string-ascii 20),
+    created-timestamp: uint,
+    last-renewal-date: (optional uint)
+  }
+)
+
+(define-map tenant-screening
+  { tenant: principal, property-id: uint, screening-id: uint }
+  {
+    credit-score: uint,
+    income-verified: bool,
+    employment-verified: bool,
+    references-checked: bool,
+    background-check-passed: bool,
+    screening-status: (string-ascii 20),
+    screening-date: uint,
+    rejection-reason: (optional (string-ascii 256)),
+    landlord-notes: (optional (string-ascii 256))
+  }
+)
+
+(define-map lease-renewals
+  { property-id: uint, lease-id: uint, renewal-id: uint }
+  {
+    old-lease-id: uint,
+    new-lease-id: uint,
+    renewal-date: uint,
+    new-end-date: uint,
+    rent-change: uint,
+    auto-renewed: bool,
+    tenant-agreed: bool,
+    renewal-terms: (string-ascii 256)
+  }
+)
+
+(define-map lease-terminations
+  { property-id: uint, lease-id: uint }
+  {
+    termination-date: uint,
+    termination-reason: (string-ascii 256),
+    early-termination: bool,
+    fees-charged: uint,
+    notice-period: uint,
+    initiated-by: principal,
+    security-deposit-returned: bool
+  }
+)
+
+(define-data-var lease-counter uint u0)
+(define-data-var screening-counter uint u0)
+(define-data-var renewal-counter uint u0)
+
+(define-read-only (get-lease-agreement (property-id uint) (lease-id uint))
+  (map-get? lease-agreements { property-id: property-id, lease-id: lease-id })
+)
+
+(define-read-only (get-tenant-screening (tenant principal) (property-id uint) (screening-id uint))
+  (map-get? tenant-screening { tenant: tenant, property-id: property-id, screening-id: screening-id })
+)
+
+(define-read-only (get-lease-renewal (property-id uint) (lease-id uint) (renewal-id uint))
+  (map-get? lease-renewals { property-id: property-id, lease-id: lease-id, renewal-id: renewal-id })
+)
+
+(define-read-only (get-lease-termination (property-id uint) (lease-id uint))
+  (map-get? lease-terminations { property-id: property-id, lease-id: lease-id })
+)
+
+(define-read-only (is-lease-active (property-id uint) (lease-id uint))
+  (let (
+    (lease (unwrap! (get-lease-agreement property-id lease-id) false))
+    (current-time stacks-block-height)
+  )
+    (and 
+      (>= current-time (get start-date lease))
+      (<= current-time (get end-date lease))
+      (is-eq (get lease-status lease) "active")
+    )
+  )
+)
+
+(define-read-only (is-lease-renewal-due (property-id uint) (lease-id uint))
+  (let (
+    (lease (unwrap! (get-lease-agreement property-id lease-id) false))
+    (current-time stacks-block-height)
+    (notice-period (get renewal-notice-period lease))
+    (renewal-deadline (- (get end-date lease) (* notice-period SECONDS_IN_DAY)))
+  )
+    (and 
+      (get auto-renewal lease)
+      (>= current-time renewal-deadline)
+      (is-eq (get lease-status lease) "active")
+    )
+  )
+)
+
+(define-public (create-lease-agreement (property-id uint) (tenant principal) (lease-term-months uint) (auto-renewal bool) (renewal-notice-period uint) (early-termination-allowed bool) (early-termination-fee uint))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (lease-id (+ (var-get lease-counter) u1))
+    (current-time stacks-block-height)
+    (lease-end-date (+ current-time (* lease-term-months u30 SECONDS_IN_DAY)))
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (> lease-term-months u0) ERR_INVALID_LEASE_TERM)
+    (asserts! (<= lease-term-months u24) ERR_INVALID_LEASE_TERM)
+    (asserts! (> renewal-notice-period u0) ERR_INVALID_LEASE_TERM)
+    (asserts! (<= renewal-notice-period u90) ERR_INVALID_LEASE_TERM)
+    
+    (map-set lease-agreements
+      { property-id: property-id, lease-id: lease-id }
+      {
+        tenant: tenant,
+        start-date: current-time,
+        end-date: lease-end-date,
+        lease-term-months: lease-term-months,
+        security-deposit: (get security-deposit property),
+        monthly-rent: (get rent-amount property),
+        auto-renewal: auto-renewal,
+        renewal-notice-period: renewal-notice-period,
+        early-termination-allowed: early-termination-allowed,
+        early-termination-fee: early-termination-fee,
+        lease-status: "active",
+        created-timestamp: current-time,
+        last-renewal-date: none
+      }
+    )
+    
+    (var-set lease-counter lease-id)
+    (ok lease-id)
+  )
+)
+
+(define-public (conduct-tenant-screening (tenant principal) (property-id uint) (credit-score uint) (income-verified bool) (employment-verified bool) (references-checked bool) (background-check-passed bool) (landlord-notes (optional (string-ascii 256))))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (screening-id (+ (var-get screening-counter) u1))
+    (current-time stacks-block-height)
+    (screening-passed (and income-verified employment-verified references-checked background-check-passed (>= credit-score u600)))
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (>= credit-score u300) ERR_INVALID_AMOUNT)
+    (asserts! (<= credit-score u850) ERR_INVALID_AMOUNT)
+    
+    (map-set tenant-screening
+      { tenant: tenant, property-id: property-id, screening-id: screening-id }
+      {
+        credit-score: credit-score,
+        income-verified: income-verified,
+        employment-verified: employment-verified,
+        references-checked: references-checked,
+        background-check-passed: background-check-passed,
+        screening-status: (if screening-passed "approved" "rejected"),
+        screening-date: current-time,
+        rejection-reason: (if screening-passed none (some "Failed screening criteria")),
+        landlord-notes: landlord-notes
+      }
+    )
+    
+    (var-set screening-counter screening-id)
+    (ok screening-id)
+  )
+)
+
+(define-public (renew-lease (property-id uint) (lease-id uint) (new-term-months uint) (rent-change uint) (tenant-agreed bool))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (lease (unwrap! (get-lease-agreement property-id lease-id) ERR_LEASE_NOT_FOUND))
+    (renewal-id (+ (var-get renewal-counter) u1))
+    (new-lease-id (+ (var-get lease-counter) u1))
+    (current-time stacks-block-height)
+    (new-end-date (+ (get end-date lease) (* new-term-months u30 SECONDS_IN_DAY)))
+    (new-rent (+ (get monthly-rent lease) rent-change))
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (is-lease-renewal-due property-id lease-id) ERR_INVALID_LEASE_TERM)
+    (asserts! (> new-term-months u0) ERR_INVALID_LEASE_TERM)
+    (asserts! (<= new-term-months u24) ERR_INVALID_LEASE_TERM)
+    (asserts! tenant-agreed ERR_UNAUTHORIZED)
+    
+    (map-set lease-renewals
+      { property-id: property-id, lease-id: lease-id, renewal-id: renewal-id }
+      {
+        old-lease-id: lease-id,
+        new-lease-id: new-lease-id,
+        renewal-date: current-time,
+        new-end-date: new-end-date,
+        rent-change: rent-change,
+        auto-renewed: (get auto-renewal lease),
+        tenant-agreed: tenant-agreed,
+        renewal-terms: "Standard lease renewal"
+      }
+    )
+    
+    (map-set lease-agreements
+      { property-id: property-id, lease-id: new-lease-id }
+      (merge lease {
+        end-date: new-end-date,
+        lease-term-months: new-term-months,
+        monthly-rent: new-rent,
+        last-renewal-date: (some current-time)
+      })
+    )
+    
+    (map-set lease-agreements
+      { property-id: property-id, lease-id: lease-id }
+      (merge lease { lease-status: "renewed" })
+    )
+    
+    (var-set renewal-counter renewal-id)
+    (var-set lease-counter new-lease-id)
+    (ok new-lease-id)
+  )
+)
+
+(define-public (terminate-lease (property-id uint) (lease-id uint) (termination-reason (string-ascii 256)) (early-termination bool) (notice-period uint))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (lease (unwrap! (get-lease-agreement property-id lease-id) ERR_LEASE_NOT_FOUND))
+    (tenant (get tenant lease))
+    (current-time stacks-block-height)
+    (fees-charged (if early-termination (get early-termination-fee lease) u0))
+  )
+    (asserts! (or (is-eq (get owner property) caller) (is-eq tenant caller)) ERR_UNAUTHORIZED)
+    (asserts! (is-lease-active property-id lease-id) ERR_LEASE_EXPIRED)
+    (asserts! (or (not early-termination) (get early-termination-allowed lease)) ERR_EARLY_TERMINATION_NOT_ALLOWED)
+    
+    (map-set lease-terminations
+      { property-id: property-id, lease-id: lease-id }
+      {
+        termination-date: current-time,
+        termination-reason: termination-reason,
+        early-termination: early-termination,
+        fees-charged: fees-charged,
+        notice-period: notice-period,
+        initiated-by: caller,
+        security-deposit-returned: false
+      }
+    )
+    
+    (map-set lease-agreements
+      { property-id: property-id, lease-id: lease-id }
+      (merge lease { lease-status: "terminated" })
+    )
+    
+    (if early-termination
+      (try! (stx-transfer? fees-charged tenant (get owner property)))
+      true
+    )
+    (ok true)
+  )
+)
+
+(define-public (auto-renew-lease (property-id uint) (lease-id uint))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (lease (unwrap! (get-lease-agreement property-id lease-id) ERR_LEASE_NOT_FOUND))
+    (new-lease-id (+ (var-get lease-counter) u1))
+    (current-time stacks-block-height)
+    (new-end-date (+ (get end-date lease) (* (get lease-term-months lease) u30 SECONDS_IN_DAY)))
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (get auto-renewal lease) ERR_AUTO_RENEWAL_DISABLED)
+    (asserts! (is-lease-renewal-due property-id lease-id) ERR_INVALID_LEASE_TERM)
+    
+    ;; (map-set lease-agreements
+    ;;   { property-id: property-id, lease-id: new-lease-id }
+    ;;   (merge lease {
+    ;;     lease-id: new-lease-id,
+    ;;     end-date: new-end-date,
+    ;;     last-renewal-date: (some current-time)
+    ;;   })
+    ;; )
+    
+    (map-set lease-agreements
+      { property-id: property-id, lease-id: lease-id }
+      (merge lease { lease-status: "auto-renewed" })
+    )
+    
+    (var-set lease-counter new-lease-id)
+    (ok new-lease-id)
+  )
+)
