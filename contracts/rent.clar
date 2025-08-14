@@ -556,6 +556,12 @@
 (define-constant ERR_TENANT_REJECTED (err u120))
 (define-constant ERR_AUTO_RENEWAL_DISABLED (err u121))
 (define-constant ERR_EARLY_TERMINATION_NOT_ALLOWED (err u122))
+(define-constant ERR_POLICY_NOT_FOUND (err u123))
+(define-constant ERR_POLICY_EXPIRED (err u124))
+(define-constant ERR_CLAIM_NOT_FOUND (err u125))
+(define-constant ERR_CLAIM_ALREADY_EXISTS (err u126))
+(define-constant ERR_INVALID_POLICY_TERM (err u127))
+(define-constant ERR_INSUFFICIENT_COVERAGE (err u128))
 
 (define-map lease-agreements
   { property-id: uint, lease-id: uint }
@@ -622,6 +628,66 @@
 (define-data-var screening-counter uint u0)
 (define-data-var renewal-counter uint u0)
 
+;; Insurance Management System
+(define-map insurance-policies
+  { property-id: uint, policy-id: uint }
+  {
+    insurance-company: (string-ascii 100),
+    policy-number: (string-ascii 50),
+    policy-type: (string-ascii 30),
+    coverage-amount: uint,
+    deductible: uint,
+    annual-premium: uint,
+    start-date: uint,
+    end-date: uint,
+    auto-renewal: bool,
+    policy-status: (string-ascii 20),
+    last-premium-payment: uint,
+    created-timestamp: uint
+  }
+)
+
+(define-map insurance-claims
+  { property-id: uint, policy-id: uint, claim-id: uint }
+  {
+    claim-type: (string-ascii 50),
+    claim-amount: uint,
+    damage-description: (string-ascii 500),
+    claim-date: uint,
+    claim-status: (string-ascii 20),
+    approved-amount: uint,
+    settlement-date: (optional uint),
+    adjuster-notes: (optional (string-ascii 300)),
+    submitted-by: principal
+  }
+)
+
+(define-map premium-payments
+  { property-id: uint, policy-id: uint, payment-year: uint }
+  {
+    amount-paid: uint,
+    payment-date: uint,
+    paid-on-time: bool,
+    late-fee: uint,
+    payment-method: (string-ascii 20)
+  }
+)
+
+(define-map coverage-details
+  { property-id: uint, policy-id: uint }
+  {
+    dwelling-coverage: uint,
+    personal-property: uint,
+    liability-coverage: uint,
+    loss-of-use: uint,
+    additional-coverages: (string-ascii 200),
+    exclusions: (string-ascii 300)
+  }
+)
+
+(define-data-var policy-counter uint u0)
+(define-data-var claim-counter uint u0)
+
 (define-read-only (get-lease-agreement (property-id uint) (lease-id uint))
   (map-get? lease-agreements { property-id: property-id, lease-id: lease-id })
 )
@@ -636,6 +702,50 @@
 
 (define-read-only (get-lease-termination (property-id uint) (lease-id uint))
   (map-get? lease-terminations { property-id: property-id, lease-id: lease-id })
+)
+
+;; Insurance read-only functions
+(define-read-only (get-insurance-policy (property-id uint) (policy-id uint))
+  (map-get? insurance-policies { property-id: property-id, policy-id: policy-id })
+)
+
+(define-read-only (get-insurance-claim (property-id uint) (policy-id uint) (claim-id uint))
+  (map-get? insurance-claims { property-id: property-id, policy-id: policy-id, claim-id: claim-id })
+)
+
+(define-read-only (get-premium-payment (property-id uint) (policy-id uint) (payment-year uint))
+  (map-get? premium-payments { property-id: property-id, policy-id: policy-id, payment-year: payment-year })
+)
+
+(define-read-only (get-coverage-details (property-id uint) (policy-id uint))
+  (map-get? coverage-details { property-id: property-id, policy-id: policy-id })
+)
+
+(define-read-only (is-policy-active (property-id uint) (policy-id uint))
+  (let (
+    (policy (unwrap! (get-insurance-policy property-id policy-id) false))
+    (current-time stacks-block-height)
+  )
+    (and 
+      (>= current-time (get start-date policy))
+      (<= current-time (get end-date policy))
+      (is-eq (get policy-status policy) "active")
+    )
+  )
+)
+
+(define-read-only (is-premium-due (property-id uint) (policy-id uint))
+  (let (
+    (policy (unwrap! (get-insurance-policy property-id policy-id) false))
+    (current-time stacks-block-height)
+    (current-year (+ u2023 (/ current-time (* u365 SECONDS_IN_DAY))))
+    (last-payment (get-premium-payment property-id policy-id current-year))
+  )
+    (and 
+      (is-policy-active property-id policy-id)
+      (is-none last-payment)
+    )
+  )
 )
 
 (define-read-only (is-lease-active (property-id uint) (lease-id uint))
@@ -840,14 +950,13 @@
     (asserts! (get auto-renewal lease) ERR_AUTO_RENEWAL_DISABLED)
     (asserts! (is-lease-renewal-due property-id lease-id) ERR_INVALID_LEASE_TERM)
     
-    ;; (map-set lease-agreements
-    ;;   { property-id: property-id, lease-id: new-lease-id }
-    ;;   (merge lease {
-    ;;     lease-id: new-lease-id,
-    ;;     end-date: new-end-date,
-    ;;     last-renewal-date: (some current-time)
-    ;;   })
-    ;; )
+    (map-set lease-agreements
+      { property-id: property-id, lease-id: new-lease-id }
+      (merge lease {
+        end-date: new-end-date,
+        last-renewal-date: (some current-time)
+      })
+    )
     
     (map-set lease-agreements
       { property-id: property-id, lease-id: lease-id }
@@ -858,3 +967,214 @@
     (ok new-lease-id)
   )
 )
+
+;; Insurance Management Functions
+
+(define-public (register-insurance-policy (property-id uint) (insurance-company (string-ascii 100)) (policy-number (string-ascii 50)) (policy-type (string-ascii 30)) (coverage-amount uint) (deductible uint) (annual-premium uint) (policy-term-months uint) (auto-renewal bool))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (policy-id (+ (var-get policy-counter) u1))
+    (current-time stacks-block-height)
+    (policy-end-date (+ current-time (* policy-term-months u30 SECONDS_IN_DAY)))
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (> coverage-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> annual-premium u0) ERR_INVALID_AMOUNT)
+    (asserts! (> policy-term-months u0) ERR_INVALID_POLICY_TERM)
+    (asserts! (<= policy-term-months u60) ERR_INVALID_POLICY_TERM)
+    
+    (map-set insurance-policies
+      { property-id: property-id, policy-id: policy-id }
+      {
+        insurance-company: insurance-company,
+        policy-number: policy-number,
+        policy-type: policy-type,
+        coverage-amount: coverage-amount,
+        deductible: deductible,
+        annual-premium: annual-premium,
+        start-date: current-time,
+        end-date: policy-end-date,
+        auto-renewal: auto-renewal,
+        policy-status: "active",
+        last-premium-payment: current-time,
+        created-timestamp: current-time
+      }
+    )
+    
+    (var-set policy-counter policy-id)
+    (ok policy-id)
+  )
+)
+
+(define-public (set-coverage-details (property-id uint) (policy-id uint) (dwelling-coverage uint) (personal-property uint) (liability-coverage uint) (loss-of-use uint) (additional-coverages (string-ascii 200)) (exclusions (string-ascii 300)))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (policy (unwrap! (get-insurance-policy property-id policy-id) ERR_POLICY_NOT_FOUND))
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (is-policy-active property-id policy-id) ERR_POLICY_EXPIRED)
+    
+    (map-set coverage-details
+      { property-id: property-id, policy-id: policy-id }
+      {
+        dwelling-coverage: dwelling-coverage,
+        personal-property: personal-property,
+        liability-coverage: liability-coverage,
+        loss-of-use: loss-of-use,
+        additional-coverages: additional-coverages,
+        exclusions: exclusions
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (pay-insurance-premium (property-id uint) (policy-id uint) (payment-method (string-ascii 20)))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (policy (unwrap! (get-insurance-policy property-id policy-id) ERR_POLICY_NOT_FOUND))
+    (current-time stacks-block-height)
+    (current-year (+ u2023 (/ current-time (* u365 SECONDS_IN_DAY))))
+    (premium-amount (get annual-premium policy))
+    (existing-payment (get-premium-payment property-id policy-id current-year))
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (is-policy-active property-id policy-id) ERR_POLICY_EXPIRED)
+    (asserts! (is-none existing-payment) ERR_ALREADY_PAID)
+    
+    (map-set premium-payments
+      { property-id: property-id, policy-id: policy-id, payment-year: current-year }
+      {
+        amount-paid: premium-amount,
+        payment-date: current-time,
+        paid-on-time: true,
+        late-fee: u0,
+        payment-method: payment-method
+      }
+    )
+    
+    (map-set insurance-policies
+      { property-id: property-id, policy-id: policy-id }
+      (merge policy { last-premium-payment: current-time })
+    )
+    
+    (ok premium-amount)
+  )
+)
+
+(define-public (file-insurance-claim (property-id uint) (policy-id uint) (claim-type (string-ascii 50)) (claim-amount uint) (damage-description (string-ascii 500)))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (policy (unwrap! (get-insurance-policy property-id policy-id) ERR_POLICY_NOT_FOUND))
+    (claim-id (+ (var-get claim-counter) u1))
+    (current-time stacks-block-height)
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (is-policy-active property-id policy-id) ERR_POLICY_EXPIRED)
+    (asserts! (> claim-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= claim-amount (get coverage-amount policy)) ERR_INSUFFICIENT_COVERAGE)
+    
+    (map-set insurance-claims
+      { property-id: property-id, policy-id: policy-id, claim-id: claim-id }
+      {
+        claim-type: claim-type,
+        claim-amount: claim-amount,
+        damage-description: damage-description,
+        claim-date: current-time,
+        claim-status: "submitted",
+        approved-amount: u0,
+        settlement-date: none,
+        adjuster-notes: none,
+        submitted-by: caller
+      }
+    )
+    
+    (var-set claim-counter claim-id)
+    (ok claim-id)
+  )
+)
+
+(define-public (process-insurance-claim (property-id uint) (policy-id uint) (claim-id uint) (approved-amount uint) (claim-status (string-ascii 20)) (adjuster-notes (optional (string-ascii 300))))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (policy (unwrap! (get-insurance-policy property-id policy-id) ERR_POLICY_NOT_FOUND))
+    (claim (unwrap! (get-insurance-claim property-id policy-id claim-id) ERR_CLAIM_NOT_FOUND))
+    (current-time stacks-block-height)
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get claim-status claim) "submitted") ERR_INVALID_AMOUNT)
+    (asserts! (<= approved-amount (get claim-amount claim)) ERR_INSUFFICIENT_COVERAGE)
+    
+    (map-set insurance-claims
+      { property-id: property-id, policy-id: policy-id, claim-id: claim-id }
+      (merge claim {
+        claim-status: claim-status,
+        approved-amount: approved-amount,
+        settlement-date: (if (is-eq claim-status "approved") (some current-time) none),
+        adjuster-notes: adjuster-notes
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (renew-insurance-policy (property-id uint) (policy-id uint) (new-coverage-amount uint) (new-premium uint) (new-term-months uint))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (policy (unwrap! (get-insurance-policy property-id policy-id) ERR_POLICY_NOT_FOUND))
+    (new-policy-id (+ (var-get policy-counter) u1))
+    (current-time stacks-block-height)
+    (new-end-date (+ current-time (* new-term-months u30 SECONDS_IN_DAY)))
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (get auto-renewal policy) ERR_AUTO_RENEWAL_DISABLED)
+    (asserts! (> new-coverage-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> new-premium u0) ERR_INVALID_AMOUNT)
+    (asserts! (> new-term-months u0) ERR_INVALID_POLICY_TERM)
+    
+    (map-set insurance-policies
+      { property-id: property-id, policy-id: new-policy-id }
+      (merge policy {
+        coverage-amount: new-coverage-amount,
+        annual-premium: new-premium,
+        start-date: current-time,
+        end-date: new-end-date,
+        last-premium-payment: current-time,
+        created-timestamp: current-time
+      })
+    )
+    
+    (map-set insurance-policies
+      { property-id: property-id, policy-id: policy-id }
+      (merge policy { policy-status: "renewed" })
+    )
+    
+    (var-set policy-counter new-policy-id)
+    (ok new-policy-id)
+  )
+)
+
+(define-public (cancel-insurance-policy (property-id uint) (policy-id uint))
+  (let (
+    (caller tx-sender)
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (policy (unwrap! (get-insurance-policy property-id policy-id) ERR_POLICY_NOT_FOUND))
+  )
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (is-policy-active property-id policy-id) ERR_POLICY_EXPIRED)
+    
+    (map-set insurance-policies
+      { property-id: property-id, policy-id: policy-id }
+      (merge policy { policy-status: "cancelled" })
+    )
+    (ok true)
+  )
+)
+
+
