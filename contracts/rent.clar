@@ -562,6 +562,11 @@
 (define-constant ERR_CLAIM_ALREADY_EXISTS (err u126))
 (define-constant ERR_INVALID_POLICY_TERM (err u127))
 (define-constant ERR_INSUFFICIENT_COVERAGE (err u128))
+(define-constant ERR_INSTALLMENT_NOT_FOUND (err u129))
+(define-constant ERR_INSTALLMENT_EXISTS (err u130))
+(define-constant ERR_INVALID_INSTALLMENT_COUNT (err u131))
+(define-constant ERR_INSTALLMENT_COMPLETE (err u132))
+(define-constant ERR_INSTALLMENT_OVERDUE (err u133))
 
 (define-map lease-agreements
   { property-id: uint, lease-id: uint }
@@ -687,6 +692,31 @@
 
 (define-data-var policy-counter uint u0)
 (define-data-var claim-counter uint u0)
+
+;; Rent Installment System
+(define-map installment-plans
+  { tenant: principal, month: uint, year: uint }
+  {
+    total-rent: uint,
+    installment-count: uint,
+    installment-amount: uint,
+    due-dates: (list 4 uint),
+    payments-made: uint,
+    status: (string-ascii 20),
+    approved-by: principal,
+    created-timestamp: uint
+  }
+)
+
+(define-map installment-payments
+  { tenant: principal, month: uint, year: uint, installment-number: uint }
+  {
+    amount-paid: uint,
+    payment-date: uint,
+    late-fee: uint,
+    on-time: bool
+  }
+)
 
 (define-read-only (get-lease-agreement (property-id uint) (lease-id uint))
   (map-get? lease-agreements { property-id: property-id, lease-id: lease-id })
@@ -1177,4 +1207,159 @@
   )
 )
 
+;; Rent Installment System Functions
 
+(define-read-only (get-installment-plan (tenant principal) (month uint) (year uint))
+  (map-get? installment-plans { tenant: tenant, month: month, year: year })
+)
+
+(define-read-only (get-installment-payment (tenant principal) (month uint) (year uint) (installment-number uint))
+  (map-get? installment-payments { tenant: tenant, month: month, year: year, installment-number: installment-number })
+)
+
+(define-read-only (get-installment-status (tenant principal) (month uint) (year uint))
+  (let (
+    (plan (unwrap! (get-installment-plan tenant month year) ERR_INSTALLMENT_NOT_FOUND))
+    (payments-made (get payments-made plan))
+    (installment-count (get installment-count plan))
+  )
+    (ok {
+      total-rent: (get total-rent plan),
+      installments-remaining: (- installment-count payments-made),
+      amount-per-installment: (get installment-amount plan),
+      status: (get status plan),
+      next-due: (if (< payments-made installment-count) 
+                   (unwrap-panic (element-at? (get due-dates plan) payments-made))
+                   u0)
+    })
+  )
+)
+
+(define-public (setup-installment-plan (tenant principal) (installment-count uint))
+  (let (
+    (caller tx-sender)
+    (tenant-info (unwrap! (get-tenant-info tenant) ERR_NOT_REGISTERED))
+    (property-id (get property-id tenant-info))
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (rent-amount (get rent-amount property))
+    (date-info (get-current-month-year))
+    (month (get month date-info))
+    (year (get year date-info))
+    (current-time stacks-block-height)
+    (installment-amount (/ rent-amount installment-count))
+    (payment-day (get payment-day property))
+    (due-dates (create-due-dates payment-day installment-count current-time))
+  )
+    ;; Only property owner can approve installment plans
+    (asserts! (is-eq (get owner property) caller) ERR_UNAUTHORIZED)
+    (asserts! (and (>= installment-count u2) (<= installment-count u4)) ERR_INVALID_INSTALLMENT_COUNT)
+    (asserts! (is-none (get-installment-plan tenant month year)) ERR_INSTALLMENT_EXISTS)
+    (asserts! (is-none (get-payment-record tenant month year)) ERR_ALREADY_PAID)
+    
+    (map-set installment-plans
+      { tenant: tenant, month: month, year: year }
+      {
+        total-rent: rent-amount,
+        installment-count: installment-count,
+        installment-amount: installment-amount,
+        due-dates: due-dates,
+        payments-made: u0,
+        status: "active",
+        approved-by: caller,
+        created-timestamp: current-time
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (pay-installment (installment-number uint))
+  (let (
+    (caller tx-sender)
+    (tenant-info (unwrap! (get-tenant-info caller) ERR_NOT_REGISTERED))
+    (property-id (get property-id tenant-info))
+    (property (unwrap! (get-property property-id) ERR_NOT_REGISTERED))
+    (date-info (get-current-month-year))
+    (month (get month date-info))
+    (year (get year date-info))
+    (plan (unwrap! (get-installment-plan caller month year) ERR_INSTALLMENT_NOT_FOUND))
+    (current-time stacks-block-height)
+    (installment-amount (get installment-amount plan))
+    (due-date (unwrap! (element-at? (get due-dates plan) (- installment-number u1)) ERR_INVALID_AMOUNT))
+    (is-late (> current-time (+ due-date (* GRACE_PERIOD_DAYS SECONDS_IN_DAY))))
+    (late-fee (if is-late (calculate-late-fee installment-amount) u0))
+    (total-payment (+ installment-amount late-fee))
+  )
+    (asserts! (not (get eviction-status tenant-info)) ERR_EVICTION_IN_PROGRESS)
+    (asserts! (is-eq (get status plan) "active") ERR_INSTALLMENT_COMPLETE)
+    (asserts! (and (>= installment-number u1) (<= installment-number (get installment-count plan))) ERR_INVALID_AMOUNT)
+    (asserts! (is-eq installment-number (+ (get payments-made plan) u1)) ERR_INVALID_AMOUNT)
+    (asserts! (is-none (get-installment-payment caller month year installment-number)) ERR_ALREADY_PAID)
+    
+    (try! (stx-transfer? total-payment caller (get owner property)))
+    
+    (map-set installment-payments
+      { tenant: caller, month: month, year: year, installment-number: installment-number }
+      {
+        amount-paid: total-payment,
+        payment-date: current-time,
+        late-fee: late-fee,
+        on-time: (not is-late)
+      }
+    )
+    
+    (let (
+      (new-payments-made (+ (get payments-made plan) u1))
+      (plan-complete (is-eq new-payments-made (get installment-count plan)))
+    )
+      (map-set installment-plans
+        { tenant: caller, month: month, year: year }
+        (merge plan {
+          payments-made: new-payments-made,
+          status: (if plan-complete "completed" "active")
+        })
+      )
+      
+      ;; If all installments paid, update tenant payment status
+      (if plan-complete
+        (begin
+          (map-set rent-payments
+            { tenant: caller, month: month, year: year }
+            {
+              amount: (get total-rent plan),
+              paid-on-time: (not is-late),
+              late-fee: late-fee,
+              timestamp: current-time
+            }
+          )
+          (map-set tenants
+            { tenant-id: caller }
+            (merge tenant-info {
+              rent-paid-until: (+ current-time (* u30 SECONDS_IN_DAY)),
+              last-payment: current-time
+            })
+          )
+        )
+        true
+      )
+    )
+    
+    (ok total-payment)
+  )
+)
+
+(define-private (create-due-dates (payment-day uint) (installment-count uint) (current-time uint))
+  (if (is-eq installment-count u2)
+    (list (+ current-time (* payment-day SECONDS_IN_DAY))
+          (+ current-time (* (+ payment-day u15) SECONDS_IN_DAY)))
+    (if (is-eq installment-count u3)
+      (list (+ current-time (* payment-day SECONDS_IN_DAY))
+            (+ current-time (* (+ payment-day u10) SECONDS_IN_DAY))
+            (+ current-time (* (+ payment-day u20) SECONDS_IN_DAY)))
+      (list (+ current-time (* payment-day SECONDS_IN_DAY))
+            (+ current-time (* (+ payment-day u7) SECONDS_IN_DAY))
+            (+ current-time (* (+ payment-day u14) SECONDS_IN_DAY))
+            (+ current-time (* (+ payment-day u21) SECONDS_IN_DAY)))
+    )
+  )
+)
